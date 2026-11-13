@@ -5,8 +5,9 @@
 # - Automatically hides when a different window is on top, when Kryptex is minimized, or when Kryptex is closed
 # - Auto-switches to interactive WinSta0\Default desktop if launched from an isolated session
 # - DPMS Display standby (monitors sleep, GPUs continue mining at 100% capacity)
-# - Real-idle detection: filtered mouse cursor displacement (> 2px) & physical keystrokes (VK 8-222)
+# - Real-idle detection: filtered mouse cursor displacement (> 8px) & physical keystrokes
 # - Global hotkeys: [Win + Shift + L] and [Ctrl + Alt + L]
+# - Windows Lock detection: automatically sleeps screens on Win+L (SessionSwitch)
 
 $script:baseDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $script:baseDir) { $script:baseDir = "E:\AI\KryptexAutoSleep" }
@@ -70,6 +71,7 @@ public class Win32KryptexBoundV6 {
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll")] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam, uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
     [DllImport("user32.dll")] public static extern IntPtr DefWindowProc(IntPtr hWnd, uint uMsg, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool LockWorkStation();
     [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
     [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
@@ -113,6 +115,7 @@ public class Win32KryptexBoundV6 {
 
     private static int lastX = -1, lastY = -1;
     private static long lastActivityTick = 0;
+    private static long ignoreInputUntilTick = 0;
 
     public static void ResetActivity() {
         lastActivityTick = Environment.TickCount;
@@ -123,43 +126,66 @@ public class Win32KryptexBoundV6 {
         }
     }
 
+    public static void SetInputIgnorePeriod(int milliseconds) {
+        ignoreInputUntilTick = Environment.TickCount + milliseconds;
+        POINT pt;
+        if (GetCursorPos(out pt)) {
+            lastX = pt.x;
+            lastY = pt.y;
+        }
+    }
+
     public static bool CheckForUserInput() {
-        bool inputDetected = false;
         long now = Environment.TickCount;
         if (lastActivityTick == 0) lastActivityTick = now;
 
         POINT pt;
         if (GetCursorPos(out pt)) {
+            // If we are in the input ignore period, continuously update baseline cursor coords
+            // so residual movement/releases after clicking Sleep Now are completely swallowed
+            if (now < ignoreInputUntilTick) {
+                lastX = pt.x;
+                lastY = pt.y;
+                return false;
+            }
+
             if (lastX != -1) {
                 int dx = Math.Abs(pt.x - lastX);
                 int dy = Math.Abs(pt.y - lastY);
-                if (dx > 2 || dy > 2) {
-                    inputDetected = true;
+                // Require intentional physical mouse movement (> 8px) rather than 2px micro-jitters
+                if (dx > 8 || dy > 8) {
+                    lastActivityTick = now;
+                    lastX = pt.x;
+                    lastY = pt.y;
+                    return true;
                 }
             }
             lastX = pt.x;
             lastY = pt.y;
+        } else if (now < ignoreInputUntilTick) {
+            return false;
         }
 
+        // Mouse buttons: left (1), right (2), middle (4)
         if ((GetAsyncKeyState(1) & 0x8000) != 0 || 
             (GetAsyncKeyState(2) & 0x8000) != 0 || 
             (GetAsyncKeyState(4) & 0x8000) != 0) {
-            inputDetected = true;
-        }
-
-        if (!inputDetected) {
-            for (int k = 8; k <= 222; k++) {
-                if ((GetAsyncKeyState(k) & 0x8000) != 0) {
-                    inputDetected = true;
-                    break;
-                }
-            }
-        }
-
-        if (inputDetected) {
             lastActivityTick = now;
             return true;
         }
+
+        // Keyboard keys (VK 8 to 222) - skip modifier keys (Shift, Ctrl, Alt, Win)
+        // so releasing hotkeys like Ctrl, Alt, Win, Shift does NOT trigger an immediate wake
+        for (int k = 8; k <= 222; k++) {
+            if (k == 16 || k == 17 || k == 18 || k == 91 || k == 92 || k == 160 || k == 161 || k == 162 || k == 163 || k == 164 || k == 165) {
+                continue;
+            }
+            if ((GetAsyncKeyState(k) & 0x8000) != 0) {
+                lastActivityTick = now;
+                return true;
+            }
+        }
+
         return false;
     }
 
@@ -175,14 +201,11 @@ public class Win32KryptexBoundV6 {
 
     public static void TurnScreenOff(IntPtr ourHwnd) {
         ScreenSleeping = true;
-        // Target our own window directly via DefWindowProc instead of broadcasting to HWND_BROADCAST (0xFFFF).
-        // Broadcasting to 0xFFFF sends SC_MONITORPOWER to all 40+ top-level windows sequentially, causing multi-monitor flashing!
-        if (ourHwnd != IntPtr.Zero) {
-            DefWindowProc(ourHwnd, 0x0112, (IntPtr)0xF170, (IntPtr)2);
-        } else {
-            IntPtr res;
-            SendMessageTimeout((IntPtr)0xFFFF, 0x0112, (IntPtr)0xF170, (IntPtr)2, 0x0002, 500, out res);
-        }
+        SetInputIgnorePeriod(2500);
+
+        // Turn screen off using HWND_BROADCAST (0xFFFF) via PostMessage.
+        // PostMessage is asynchronous (does not block the thread) and powers down all connected displays cleanly.
+        PostMessage((IntPtr)0xFFFF, 0x0112, (IntPtr)0xF170, (IntPtr)2);
     }
 
     private static readonly Guid CLSID_MMDeviceEnumerator = new Guid("BCDE0395-E52F-467C-8E3D-C4579291692E");
@@ -694,15 +717,20 @@ public class Win32KryptexBoundV6 {
         Save-Config
     })
 
-    $script:sleepNowBtn.Add_Click({
-        Write-Log "User clicked [Sleep Now]. Turning screen off."
+    $script:executeScreenOff = {
+        param([string]$reason, [bool]$lockWorkstation = $false)
+        Write-Log "$reason. Turning screen off."
         $script:isScreenOff = $true
         [Win32KryptexBoundV6]::ScreenSleeping = $true
-        $script:wakeGraceUntilTick = [Environment]::TickCount + 8000
-        # Wait 450ms for physical mouse button release so releasing the click doesn't wake the monitors
-        Start-Sleep -Milliseconds 450
-        [Win32KryptexBoundV6]::ResetActivity()
+        [Win32KryptexBoundV6]::SetInputIgnorePeriod(2500)
+        if ($lockWorkstation) {
+            try { [Win32KryptexBoundV6]::LockWorkStation() | Out-Null } catch {}
+        }
         [Win32KryptexBoundV6]::TurnScreenOff($script:ourHwnd)
+    }
+
+    $script:sleepNowBtn.Add_Click({
+        & $script:executeScreenOff "User clicked [Sleep Now]" $false
     })
 
     $script:helper = New-Object System.Windows.Interop.WindowInteropHelper($script:window)
@@ -713,21 +741,36 @@ public class Win32KryptexBoundV6 {
     [Win32KryptexBoundV6]::RegisterHotKey($script:ourHwnd, 2, 0x0003, 0x4C) | Out-Null # Ctrl+Alt+L
     Write-Log "Hotkeys registered successfully (Win+Shift+L, Ctrl+Alt+L)."
 
+    # Listen for Windows Session Lock (e.g. Win+L, Start Menu Lock, LockWorkStation)
+    $script:sessionSwitchHandler = [Microsoft.Win32.SessionSwitchEventHandler]{
+        param($s, $e)
+        if ($e.Reason -eq [Microsoft.Win32.SessionSwitchReason]::SessionLock) {
+            Write-Log "Windows session locked (Win+L / SessionLock). Turning screen off."
+            $script:isScreenOff = $true
+            [Win32KryptexBoundV6]::ScreenSleeping = $true
+            [Win32KryptexBoundV6]::SetInputIgnorePeriod(3000)
+            [Win32KryptexBoundV6]::TurnScreenOff($script:ourHwnd)
+        }
+    }
+    [Microsoft.Win32.SystemEvents]::add_SessionSwitch($script:sessionSwitchHandler)
+
     $script:source.AddHook({
         param($hwnd, $msg, $wParam, $lParam, [ref]$handled)
         if ($msg -eq 0x0312) { # WM_HOTKEY
-            Write-Log "Hotkey pressed! Turning screen off."
-            $script:isScreenOff = $true
-            [Win32KryptexBoundV6]::ScreenSleeping = $true
-            $script:wakeGraceUntilTick = [Environment]::TickCount + 8000
-            Start-Sleep -Milliseconds 450
-            [Win32KryptexBoundV6]::ResetActivity()
-            [Win32KryptexBoundV6]::TurnScreenOff($script:ourHwnd)
+            $hotkeyId = [int]$wParam
+            if ($hotkeyId -eq 2) {
+                # Ctrl+Alt+L pressed
+                & $script:executeScreenOff "Hotkey pressed [Ctrl+Alt+L]" $false
+            } else {
+                # Win+Shift+L pressed
+                & $script:executeScreenOff "Hotkey pressed [Win+Shift+L]" $false
+            }
             $handled = $true
         }
     })
 
     $script:window.Add_Closed({
+        try { [Microsoft.Win32.SystemEvents]::remove_SessionSwitch($script:sessionSwitchHandler) } catch {}
         [Win32KryptexBoundV6]::StopNativeTracker()
         [Win32KryptexBoundV6]::UnregisterHotKey($script:ourHwnd, 1) | Out-Null
         [Win32KryptexBoundV6]::UnregisterHotKey($script:ourHwnd, 2) | Out-Null

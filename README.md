@@ -47,5 +47,6 @@ If you prefer to perform each step manually:
 - Monitor Sleep:
   - Uses DPMS power management to put monitors into low-power standby while GPUs continue mining at 100% capacity.
   - Eliminates multi-monitor display flashing via a single directed window procedure call.
-- Hotkeys:
+- Hotkeys and Lock Integration:
   - Press `Win + Shift + L` or `Ctrl + Alt + L` to immediately turn off screens.
+  - Windows Lock integration: Pressing `Win + L` (or locking via Start Menu) automatically puts all monitors into standby mode.
