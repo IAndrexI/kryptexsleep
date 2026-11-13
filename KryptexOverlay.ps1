@@ -26,7 +26,7 @@ function Write-Log ($msg) {
 }
 
 try {
-    if (-not ([System.Management.Automation.PSTypeName]'Win32KryptexBoundV5').Type) {
+    if (-not ([System.Management.Automation.PSTypeName]'Win32KryptexBoundV6').Type) {
         Add-Type -TypeDefinition @'
 using System;
 using System.Diagnostics;
@@ -34,7 +34,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 
-public class Win32KryptexBoundV5 {
+public class Win32KryptexBoundV6 {
     [StructLayout(LayoutKind.Sequential)] public struct POINT { public int x; public int y; }
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
 
@@ -81,6 +81,7 @@ public class Win32KryptexBoundV5 {
     [DllImport("user32.dll")] public static extern int GetClassName(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hWnd);
 
     public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc enumProc, IntPtr lParam);
@@ -393,8 +394,19 @@ public class Win32KryptexBoundV5 {
                                     int ourW = ourR.Right - ourR.Left;
                                     if (ourW <= 50) ourW = 425;
 
-                                    // 235px clearance from right border ensures Minimize, Maximize, and Close buttons are 100% visible
-                                    targetX = r.Right - ourW - 235;
+                                    int clearance = 235; // Default profile for 150% DPI (e.g. ANDREX workstation)
+                                    string host = Environment.MachineName;
+                                    if (!string.Equals(host, "ANDREX", StringComparison.OrdinalIgnoreCase)) {
+                                        // Dynamic DPI adaptation for friends' PCs
+                                        uint dpi = GetDpiForWindow(cachedKryp);
+                                        if (dpi == 0) dpi = GetDpiForWindow(ourHwnd);
+                                        if (dpi == 0) dpi = 96;
+                                        double scale = dpi / 96.0;
+                                        // Standard Windows caption buttons (Minimize, Maximize, Close) take ~140px at 100% DPI + margin
+                                        clearance = (int)(155 * scale);
+                                    }
+
+                                    targetX = r.Right - ourW - clearance;
                                     targetY = (r.Top >= -2000) ? (r.Top + 6) : 6;
                                     shouldShow = true;
                                 }
@@ -431,9 +443,9 @@ public class Win32KryptexBoundV5 {
 '@
     }
 
-    $curDesk = [Win32KryptexBoundV5]::GetCurrentDesktopName()
+    $curDesk = [Win32KryptexBoundV6]::GetCurrentDesktopName()
     if ($curDesk -and ($curDesk -ne "Default")) {
-        $newPid = [Win32KryptexBoundV5]::RelaunchOnDefaultDesktop($MyInvocation.MyCommand.Path, $script:baseDir)
+        $newPid = [Win32KryptexBoundV6]::RelaunchOnDefaultDesktop($MyInvocation.MyCommand.Path, $script:baseDir)
         Write-Log "Relaunched from isolated desktop '$curDesk' onto Winsta0\Default (PID: $newPid)."
         if ($newPid -gt 0) {
             try {
@@ -482,7 +494,7 @@ public class Win32KryptexBoundV5 {
         # 2. Check Core Audio WASAPI Peak metering for browsers (Vivaldi, Chrome, Edge, Firefox, Brave, etc.)
         try {
             $activeApp = ""
-            if ([Win32KryptexBoundV5]::IsBrowserAudioAudible([ref]$activeApp)) {
+            if ([Win32KryptexBoundV6]::IsBrowserAudioAudible([ref]$activeApp)) {
                 return @{ IsPlaying = $true; Source = "Browser Audio: $activeApp" }
             }
         } catch {}
@@ -685,20 +697,20 @@ public class Win32KryptexBoundV5 {
     $script:sleepNowBtn.Add_Click({
         Write-Log "User clicked [Sleep Now]. Turning screen off."
         $script:isScreenOff = $true
-        [Win32KryptexBoundV5]::ScreenSleeping = $true
+        [Win32KryptexBoundV6]::ScreenSleeping = $true
         $script:wakeGraceUntilTick = [Environment]::TickCount + 8000
         # Wait 450ms for physical mouse button release so releasing the click doesn't wake the monitors
         Start-Sleep -Milliseconds 450
-        [Win32KryptexBoundV5]::ResetActivity()
-        [Win32KryptexBoundV5]::TurnScreenOff($script:ourHwnd)
+        [Win32KryptexBoundV6]::ResetActivity()
+        [Win32KryptexBoundV6]::TurnScreenOff($script:ourHwnd)
     })
 
     $script:helper = New-Object System.Windows.Interop.WindowInteropHelper($script:window)
     $script:ourHwnd = $script:helper.EnsureHandle()
     $script:source = [System.Windows.Interop.HwndSource]::FromHwnd($script:ourHwnd)
 
-    [Win32KryptexBoundV5]::RegisterHotKey($script:ourHwnd, 1, 0x000C, 0x4C) | Out-Null # Win+Shift+L
-    [Win32KryptexBoundV5]::RegisterHotKey($script:ourHwnd, 2, 0x0003, 0x4C) | Out-Null # Ctrl+Alt+L
+    [Win32KryptexBoundV6]::RegisterHotKey($script:ourHwnd, 1, 0x000C, 0x4C) | Out-Null # Win+Shift+L
+    [Win32KryptexBoundV6]::RegisterHotKey($script:ourHwnd, 2, 0x0003, 0x4C) | Out-Null # Ctrl+Alt+L
     Write-Log "Hotkeys registered successfully (Win+Shift+L, Ctrl+Alt+L)."
 
     $script:source.AddHook({
@@ -706,24 +718,24 @@ public class Win32KryptexBoundV5 {
         if ($msg -eq 0x0312) { # WM_HOTKEY
             Write-Log "Hotkey pressed! Turning screen off."
             $script:isScreenOff = $true
-            [Win32KryptexBoundV5]::ScreenSleeping = $true
+            [Win32KryptexBoundV6]::ScreenSleeping = $true
             $script:wakeGraceUntilTick = [Environment]::TickCount + 8000
             Start-Sleep -Milliseconds 450
-            [Win32KryptexBoundV5]::ResetActivity()
-            [Win32KryptexBoundV5]::TurnScreenOff($script:ourHwnd)
+            [Win32KryptexBoundV6]::ResetActivity()
+            [Win32KryptexBoundV6]::TurnScreenOff($script:ourHwnd)
             $handled = $true
         }
     })
 
     $script:window.Add_Closed({
-        [Win32KryptexBoundV5]::StopNativeTracker()
-        [Win32KryptexBoundV5]::UnregisterHotKey($script:ourHwnd, 1) | Out-Null
-        [Win32KryptexBoundV5]::UnregisterHotKey($script:ourHwnd, 2) | Out-Null
+        [Win32KryptexBoundV6]::StopNativeTracker()
+        [Win32KryptexBoundV6]::UnregisterHotKey($script:ourHwnd, 1) | Out-Null
+        [Win32KryptexBoundV6]::UnregisterHotKey($script:ourHwnd, 2) | Out-Null
         Write-Log "Kryptex Companion Exited."
     })
 
     # Start dedicated 250 FPS C# window tracker thread
-    [Win32KryptexBoundV5]::StartNativeTracker($script:ourHwnd)
+    [Win32KryptexBoundV6]::StartNativeTracker($script:ourHwnd)
 
     # Idle & DPMS timer (lightweight check every 250ms)
     $script:timer = New-Object System.Windows.Threading.DispatcherTimer
@@ -734,13 +746,13 @@ public class Win32KryptexBoundV5 {
     $script:timer.Add_Tick({
         try {
             $now = [Environment]::TickCount
-            $userInput = [Win32KryptexBoundV5]::CheckForUserInput()
+            $userInput = [Win32KryptexBoundV6]::CheckForUserInput()
 
             if ($userInput) {
                 if ($script:isScreenOff) {
                     Write-Log "User input detected (mouse or key). Resuming display."
                     $script:isScreenOff = $false
-                    [Win32KryptexBoundV5]::ScreenSleeping = $false
+                    [Win32KryptexBoundV6]::ScreenSleeping = $false
                     $script:wakeGraceUntilTick = $now + 15000
                 }
             }
@@ -751,14 +763,14 @@ public class Win32KryptexBoundV5 {
 
                     $miners = Get-Process -Name $script:minerProcesses -ErrorAction SilentlyContinue
                     if ($miners) {
-                        $idleSec = [Win32KryptexBoundV5]::GetIdleSeconds()
+                        $idleSec = [Win32KryptexBoundV6]::GetIdleSeconds()
 
                         if ($idleSec -ge $script:idleThresholdSeconds) {
                             # Verify whether a video (YouTube, browser video/audio) is currently playing
                             $videoStatus = Test-IsVideoOrAudioPlaying
                             if ($videoStatus.IsPlaying) {
                                 # Prevent auto-sleep while YouTube/video is playing; reset activity tick so user is not interrupted
-                                [Win32KryptexBoundV5]::ResetActivity()
+                                [Win32KryptexBoundV6]::ResetActivity()
                                 if (($now - $script:lastVideoPlayingLog) -gt 60000 -or ($now - $script:lastVideoPlayingLog) -lt 0) {
                                     Write-Log "Idle threshold reached ($($script:idleThresholdSeconds)s), but sleep deferred because $($videoStatus.Source) is active."
                                     $script:lastVideoPlayingLog = $now
@@ -766,8 +778,8 @@ public class Win32KryptexBoundV5 {
                             } else {
                                 Write-Log "Idle threshold ($($script:idleThresholdSeconds)s) reached while mining. Turning screen off once."
                                 $script:isScreenOff = $true
-                                [Win32KryptexBoundV5]::ScreenSleeping = $true
-                                [Win32KryptexBoundV5]::TurnScreenOff($script:ourHwnd)
+                                [Win32KryptexBoundV6]::ScreenSleeping = $true
+                                [Win32KryptexBoundV6]::TurnScreenOff($script:ourHwnd)
                             }
                         }
                     }
