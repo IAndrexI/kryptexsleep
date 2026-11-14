@@ -412,6 +412,12 @@ public class Win32KryptexBoundV6 {
 
     private static Thread trackerThread;
     private static volatile bool trackerRunning = false;
+    private static volatile int wakeStabilizeUntilTick = 0;
+
+    public static void NotifyDisplayResuming() {
+        ScreenSleeping = false;
+        wakeStabilizeUntilTick = Environment.TickCount + 2000;
+    }
 
     public static void StartNativeTracker(IntPtr ourHwnd) {
         if (trackerRunning) return;
@@ -424,13 +430,19 @@ public class Win32KryptexBoundV6 {
 
             while (trackerRunning) {
                 try {
-                    // Pause window tracking & DWM updates while monitors are sleeping so DWM doesn't wake/flash displays
+                    // Pause window tracking & DWM updates while monitors are sleeping, or during display wake stabilization
+                    // so SetWindowPos/DWM does not interfere with the GPU driver restoring display link training across multi-monitors
                     if (ScreenSleeping) {
                         Thread.Sleep(250);
                         continue;
                     }
 
                     int now = Environment.TickCount;
+                    if (now < wakeStabilizeUntilTick) {
+                        Thread.Sleep(100);
+                        continue;
+                    }
+
                     if (cachedKryp == IntPtr.Zero || !IsWindow(cachedKryp) || (now - lastSearchTick) > 500) {
                         cachedKryp = FindKryptex();
                         lastSearchTick = now;
@@ -829,9 +841,9 @@ public class Win32KryptexBoundV6 {
                 if ($script:isScreenOff) {
                     Write-Log "User input detected ($triggerReason). Resuming display."
                     $script:isScreenOff = $false
-                    [Win32KryptexBoundV6]::ScreenSleeping = $false
+                    [Win32KryptexBoundV6]::NotifyDisplayResuming()
                     [Win32KryptexBoundV6]::ForceSleepMode = $false
-                    $script:wakeGraceUntilTick = $now + 15000
+                    $script:wakeGraceUntilTick = $now + 20000
                 }
             }
 
