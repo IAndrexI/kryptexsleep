@@ -116,6 +116,8 @@ public class Win32KryptexBoundV6 {
     private static int lastX = -1, lastY = -1;
     private static long lastActivityTick = 0;
     private static long ignoreInputUntilTick = 0;
+    public static volatile bool ForceSleepMode = false;
+    private static int accumulatedMouseDisplacement = 0;
 
     public static void ResetActivity() {
         lastActivityTick = Environment.TickCount;
@@ -124,6 +126,7 @@ public class Win32KryptexBoundV6 {
             lastX = pt.x;
             lastY = pt.y;
         }
+        accumulatedMouseDisplacement = 0;
     }
 
     public static void SetInputIgnorePeriod(int milliseconds) {
@@ -133,55 +136,87 @@ public class Win32KryptexBoundV6 {
             lastX = pt.x;
             lastY = pt.y;
         }
+        accumulatedMouseDisplacement = 0;
     }
 
-    public static bool CheckForUserInput() {
+    public static bool CheckForUserInput(out string triggerReason) {
+        triggerReason = "";
         long now = Environment.TickCount;
         if (lastActivityTick == 0) lastActivityTick = now;
 
+        // If in input-ignore grace window, continuously swallow any cursor movement/button releases
+        if (now < ignoreInputUntilTick) {
+            POINT ptGrace;
+            if (GetCursorPos(out ptGrace)) {
+                lastX = ptGrace.x;
+                lastY = ptGrace.y;
+            }
+            accumulatedMouseDisplacement = 0;
+            return false;
+        }
+
+        // 1. Mouse Movement Detection
         POINT pt;
         if (GetCursorPos(out pt)) {
-            // If we are in the input ignore period, continuously update baseline cursor coords
-            // so residual movement/releases after clicking Sleep Now are completely swallowed
-            if (now < ignoreInputUntilTick) {
-                lastX = pt.x;
-                lastY = pt.y;
-                return false;
-            }
-
             if (lastX != -1) {
                 int dx = Math.Abs(pt.x - lastX);
                 int dy = Math.Abs(pt.y - lastY);
-                // Require intentional physical mouse movement (> 8px) rather than 2px micro-jitters
-                if (dx > 8 || dy > 8) {
+
+                // When ForceSleepMode is active (user clicked Sleep Now / Hotkey / Lock):
+                // require substantial intentional physical movement (> 80px) so desk vibration/optical drift NEVER wakes it.
+                // When normal idle sleep: require > 25px intentional movement.
+                int threshold = ForceSleepMode ? 80 : 25;
+
+                if (dx > 3 || dy > 3) {
+                    accumulatedMouseDisplacement += (dx + dy);
+                }
+
+                if (dx > threshold || dy > threshold || accumulatedMouseDisplacement > (threshold * 2)) {
                     lastActivityTick = now;
+                    triggerReason = string.Format("Mouse displacement (dx={0}, dy={1}, total={2})", dx, dy, accumulatedMouseDisplacement);
                     lastX = pt.x;
                     lastY = pt.y;
+                    accumulatedMouseDisplacement = 0;
                     return true;
                 }
             }
             lastX = pt.x;
             lastY = pt.y;
-        } else if (now < ignoreInputUntilTick) {
-            return false;
         }
 
-        // Mouse buttons: left (1), right (2), middle (4)
-        if ((GetAsyncKeyState(1) & 0x8000) != 0 || 
-            (GetAsyncKeyState(2) & 0x8000) != 0 || 
-            (GetAsyncKeyState(4) & 0x8000) != 0) {
+        // 2. Physical Mouse Click Detection (Left=1, Right=2, Middle=4, XButtons=5,6)
+        if ((GetAsyncKeyState(1) & 0x8000) != 0) {
             lastActivityTick = now;
+            triggerReason = "Mouse Left Click";
+            accumulatedMouseDisplacement = 0;
+            return true;
+        }
+        if ((GetAsyncKeyState(2) & 0x8000) != 0) {
+            lastActivityTick = now;
+            triggerReason = "Mouse Right Click";
+            accumulatedMouseDisplacement = 0;
+            return true;
+        }
+        if ((GetAsyncKeyState(4) & 0x8000) != 0) {
+            lastActivityTick = now;
+            triggerReason = "Mouse Middle Click";
+            accumulatedMouseDisplacement = 0;
             return true;
         }
 
-        // Keyboard keys (VK 8 to 222) - skip modifier keys (Shift, Ctrl, Alt, Win)
-        // so releasing hotkeys like Ctrl, Alt, Win, Shift does NOT trigger an immediate wake
+        // 3. Physical Keyboard Key Presses (VK 8 to 222)
+        // Strict filter: Ignore all modifiers (Shift, Ctrl, Alt, Win, CapsLock, NumLock, ScrollLock)
         for (int k = 8; k <= 222; k++) {
-            if (k == 16 || k == 17 || k == 18 || k == 91 || k == 92 || k == 160 || k == 161 || k == 162 || k == 163 || k == 164 || k == 165) {
+            // VK_SHIFT(16), VK_CONTROL(17), VK_MENU/ALT(18), VK_CAPITAL(20), VK_LWIN(91), VK_RWIN(92), VK_NUMLOCK(144), VK_SCROLL(145)
+            // VK_LSHIFT(160), VK_RSHIFT(161), VK_LCONTROL(162), VK_RCONTROL(163), VK_LMENU(164), VK_RMENU(165)
+            if (k == 16 || k == 17 || k == 18 || k == 20 || k == 91 || k == 92 || k == 144 || k == 145 ||
+                k == 160 || k == 161 || k == 162 || k == 163 || k == 164 || k == 165) {
                 continue;
             }
             if ((GetAsyncKeyState(k) & 0x8000) != 0) {
                 lastActivityTick = now;
+                triggerReason = string.Format("Key VK_{0}", k);
+                accumulatedMouseDisplacement = 0;
                 return true;
             }
         }
@@ -190,7 +225,8 @@ public class Win32KryptexBoundV6 {
     }
 
     public static int GetIdleSeconds() {
-        CheckForUserInput();
+        string dummy;
+        CheckForUserInput(out dummy);
         long now = Environment.TickCount;
         long diff = now - lastActivityTick;
         if (diff < 0) { lastActivityTick = now; return 0; }
@@ -201,10 +237,10 @@ public class Win32KryptexBoundV6 {
 
     public static void TurnScreenOff(IntPtr ourHwnd) {
         ScreenSleeping = true;
-        SetInputIgnorePeriod(2500);
+        SetInputIgnorePeriod(3500);
 
         // Turn screen off using HWND_BROADCAST (0xFFFF) via PostMessage.
-        // PostMessage is asynchronous (does not block the thread) and powers down all connected displays cleanly.
+        // PostMessage is asynchronous and instructs Windows display driver to enter DPMS standby.
         PostMessage((IntPtr)0xFFFF, 0x0112, (IntPtr)0xF170, (IntPtr)2);
     }
 
@@ -718,11 +754,12 @@ public class Win32KryptexBoundV6 {
     })
 
     $script:executeScreenOff = {
-        param([string]$reason, [bool]$lockWorkstation = $false)
-        Write-Log "$reason. Turning screen off."
+        param([string]$reason, [bool]$lockWorkstation = $false, [bool]$isForce = $false)
+        Write-Log "$reason. Turning screen off (ForceMode=$isForce)."
         $script:isScreenOff = $true
         [Win32KryptexBoundV6]::ScreenSleeping = $true
-        [Win32KryptexBoundV6]::SetInputIgnorePeriod(2500)
+        [Win32KryptexBoundV6]::ForceSleepMode = $isForce
+        [Win32KryptexBoundV6]::SetInputIgnorePeriod(3500)
         if ($lockWorkstation) {
             try { [Win32KryptexBoundV6]::LockWorkStation() | Out-Null } catch {}
         }
@@ -730,7 +767,7 @@ public class Win32KryptexBoundV6 {
     }
 
     $script:sleepNowBtn.Add_Click({
-        & $script:executeScreenOff "User clicked [Sleep Now]" $false
+        & $script:executeScreenOff "User clicked [Sleep Now]" $false $true
     })
 
     $script:helper = New-Object System.Windows.Interop.WindowInteropHelper($script:window)
@@ -745,11 +782,7 @@ public class Win32KryptexBoundV6 {
     $script:sessionSwitchHandler = [Microsoft.Win32.SessionSwitchEventHandler]{
         param($s, $e)
         if ($e.Reason -eq [Microsoft.Win32.SessionSwitchReason]::SessionLock) {
-            Write-Log "Windows session locked (Win+L / SessionLock). Turning screen off."
-            $script:isScreenOff = $true
-            [Win32KryptexBoundV6]::ScreenSleeping = $true
-            [Win32KryptexBoundV6]::SetInputIgnorePeriod(3000)
-            [Win32KryptexBoundV6]::TurnScreenOff($script:ourHwnd)
+            & $script:executeScreenOff "Windows session locked (Win+L / SessionLock)" $false $true
         }
     }
     [Microsoft.Win32.SystemEvents]::add_SessionSwitch($script:sessionSwitchHandler)
@@ -760,10 +793,10 @@ public class Win32KryptexBoundV6 {
             $hotkeyId = [int]$wParam
             if ($hotkeyId -eq 2) {
                 # Ctrl+Alt+L pressed
-                & $script:executeScreenOff "Hotkey pressed [Ctrl+Alt+L]" $false
+                & $script:executeScreenOff "Hotkey pressed [Ctrl+Alt+L]" $false $true
             } else {
                 # Win+Shift+L pressed
-                & $script:executeScreenOff "Hotkey pressed [Win+Shift+L]" $false
+                & $script:executeScreenOff "Hotkey pressed [Win+Shift+L]" $false $true
             }
             $handled = $true
         }
@@ -789,13 +822,15 @@ public class Win32KryptexBoundV6 {
     $script:timer.Add_Tick({
         try {
             $now = [Environment]::TickCount
-            $userInput = [Win32KryptexBoundV6]::CheckForUserInput()
+            $triggerReason = ""
+            $userInput = [Win32KryptexBoundV6]::CheckForUserInput([ref]$triggerReason)
 
             if ($userInput) {
                 if ($script:isScreenOff) {
-                    Write-Log "User input detected (mouse or key). Resuming display."
+                    Write-Log "User input detected ($triggerReason). Resuming display."
                     $script:isScreenOff = $false
                     [Win32KryptexBoundV6]::ScreenSleeping = $false
+                    [Win32KryptexBoundV6]::ForceSleepMode = $false
                     $script:wakeGraceUntilTick = $now + 15000
                 }
             }
@@ -820,9 +855,7 @@ public class Win32KryptexBoundV6 {
                                 }
                             } else {
                                 Write-Log "Idle threshold ($($script:idleThresholdSeconds)s) reached while mining. Turning screen off once."
-                                $script:isScreenOff = $true
-                                [Win32KryptexBoundV6]::ScreenSleeping = $true
-                                [Win32KryptexBoundV6]::TurnScreenOff($script:ourHwnd)
+                                & $script:executeScreenOff "Auto-idle threshold reached ($($script:idleThresholdSeconds)s)" $false $false
                             }
                         }
                     }
