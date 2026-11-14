@@ -129,8 +129,17 @@ public class Win32KryptexBoundV6 {
         accumulatedMouseDisplacement = 0;
     }
 
+    private static bool[] heldAtSleep = new bool[256];
+    private static long keyIgnoreUntilTick = 0;
+
     public static void SetInputIgnorePeriod(int milliseconds) {
         ignoreInputUntilTick = Environment.TickCount + milliseconds;
+        // Keys get only a very short grace (400ms) and keys physically held right now
+        // (e.g. Ctrl+Alt+L hotkey) are ignored until released. Any NEW key press wakes instantly.
+        keyIgnoreUntilTick = Environment.TickCount + 400;
+        for (int k = 1; k < 256; k++) {
+            heldAtSleep[k] = (GetAsyncKeyState(k) & 0x8000) != 0;
+        }
         POINT pt;
         if (GetCursorPos(out pt)) {
             lastX = pt.x;
@@ -143,6 +152,21 @@ public class Win32KryptexBoundV6 {
         triggerReason = "";
         long now = Environment.TickCount;
         if (lastActivityTick == 0) lastActivityTick = now;
+
+        // 0. Keyboard: ANY newly pressed key (including Shift/Ctrl/Alt/Win/Caps) wakes the display immediately.
+        for (int k = 8; k <= 255; k++) {
+            bool down = (GetAsyncKeyState(k) & 0x8000) != 0;
+            if (heldAtSleep[k]) {
+                if (!down) heldAtSleep[k] = false;
+                continue;
+            }
+            if (down && now >= keyIgnoreUntilTick) {
+                lastActivityTick = now;
+                triggerReason = string.Format("Key VK_{0}", k);
+                accumulatedMouseDisplacement = 0;
+                return true;
+            }
+        }
 
         // If in input-ignore grace window, continuously swallow any cursor movement/button releases
         if (now < ignoreInputUntilTick) {
@@ -162,9 +186,6 @@ public class Win32KryptexBoundV6 {
                 int dx = Math.Abs(pt.x - lastX);
                 int dy = Math.Abs(pt.y - lastY);
 
-                // When ForceSleepMode is active (user clicked Sleep Now / Hotkey / Lock):
-                // require substantial intentional physical movement (> 80px) so desk vibration/optical drift NEVER wakes it.
-                // When normal idle sleep: require > 25px intentional movement.
                 int threshold = ForceSleepMode ? 80 : 25;
 
                 if (dx > 3 || dy > 3) {
@@ -184,7 +205,7 @@ public class Win32KryptexBoundV6 {
             lastY = pt.y;
         }
 
-        // 2. Physical Mouse Click Detection (Left=1, Right=2, Middle=4, XButtons=5,6)
+        // 2. Physical Mouse Click Detection
         if ((GetAsyncKeyState(1) & 0x8000) != 0) {
             lastActivityTick = now;
             triggerReason = "Mouse Left Click";
@@ -202,23 +223,6 @@ public class Win32KryptexBoundV6 {
             triggerReason = "Mouse Middle Click";
             accumulatedMouseDisplacement = 0;
             return true;
-        }
-
-        // 3. Physical Keyboard Key Presses (VK 8 to 222)
-        // Strict filter: Ignore all modifiers (Shift, Ctrl, Alt, Win, CapsLock, NumLock, ScrollLock)
-        for (int k = 8; k <= 222; k++) {
-            // VK_SHIFT(16), VK_CONTROL(17), VK_MENU/ALT(18), VK_CAPITAL(20), VK_LWIN(91), VK_RWIN(92), VK_NUMLOCK(144), VK_SCROLL(145)
-            // VK_LSHIFT(160), VK_RSHIFT(161), VK_LCONTROL(162), VK_RCONTROL(163), VK_LMENU(164), VK_RMENU(165)
-            if (k == 16 || k == 17 || k == 18 || k == 20 || k == 91 || k == 92 || k == 144 || k == 145 ||
-                k == 160 || k == 161 || k == 162 || k == 163 || k == 164 || k == 165) {
-                continue;
-            }
-            if ((GetAsyncKeyState(k) & 0x8000) != 0) {
-                lastActivityTick = now;
-                triggerReason = string.Format("Key VK_{0}", k);
-                accumulatedMouseDisplacement = 0;
-                return true;
-            }
         }
 
         return false;
