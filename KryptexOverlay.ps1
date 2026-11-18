@@ -186,6 +186,14 @@ public class Win32KryptexBoundV6 {
                 int dx = Math.Abs(pt.x - lastX);
                 int dy = Math.Abs(pt.y - lastY);
 
+                // Ignore sudden multi-monitor cursor teleports when displays disconnect or enter sleep (> 300px in 1 tick)
+                if (ScreenSleeping && (dx > 300 || dy > 300)) {
+                    lastX = pt.x;
+                    lastY = pt.y;
+                    accumulatedMouseDisplacement = 0;
+                    return false;
+                }
+
                 int threshold = ForceSleepMode ? 80 : 25;
 
                 if (dx > 3 || dy > 3) {
@@ -241,11 +249,13 @@ public class Win32KryptexBoundV6 {
 
     public static void TurnScreenOff(IntPtr ourHwnd) {
         ScreenSleeping = true;
-        SetInputIgnorePeriod(3500);
+        SetInputIgnorePeriod(5000);
 
-        // Turn screen off using HWND_BROADCAST (0xFFFF) via PostMessage.
-        // PostMessage is asynchronous and instructs Windows display driver to enter DPMS standby.
-        PostMessage((IntPtr)0xFFFF, 0x0112, (IntPtr)0xF170, (IntPtr)2);
+        // Turn screen off using HWND_BROADCAST ((IntPtr)(-1)) via SendMessageTimeout and PostMessage.
+        // HWND_BROADCAST on 64-bit Windows is (IntPtr)(-1), NOT 0xFFFF.
+        IntPtr result;
+        SendMessageTimeout((IntPtr)(-1), 0x0112, (IntPtr)0xF170, (IntPtr)2, 0x0002, 1000, out result);
+        PostMessage((IntPtr)(-1), 0x0112, (IntPtr)0xF170, (IntPtr)2);
     }
 
     private static readonly Guid CLSID_MMDeviceEnumerator = new Guid("BCDE0395-E52F-467C-8E3D-C4579291692E");
@@ -418,9 +428,14 @@ public class Win32KryptexBoundV6 {
     private static volatile bool trackerRunning = false;
     private static volatile int wakeStabilizeUntilTick = 0;
 
+    [DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint esFlags);
+
     public static void NotifyDisplayResuming() {
         ScreenSleeping = false;
-        wakeStabilizeUntilTick = Environment.TickCount + 2000;
+        // Hold all window repositioning/DWM work for 3s while the GPUs re-train every display link
+        wakeStabilizeUntilTick = Environment.TickCount + 3000;
+        // One-shot ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED: asks Windows to power every monitor on in one clean step
+        SetThreadExecutionState(0x00000003);
     }
 
     public static void StartNativeTracker(IntPtr ourHwnd) {
@@ -443,6 +458,11 @@ public class Win32KryptexBoundV6 {
 
                     int now = Environment.TickCount;
                     if (now < wakeStabilizeUntilTick) {
+                        // Keep the overlay hidden while displays wake; it reappears smoothly afterwards
+                        if (wasShown || IsWindowVisible(ourHwnd)) {
+                            ShowWindow(ourHwnd, 0);
+                            wasShown = false;
+                        }
                         Thread.Sleep(100);
                         continue;
                     }
@@ -775,15 +795,20 @@ public class Win32KryptexBoundV6 {
         $script:isScreenOff = $true
         [Win32KryptexBoundV6]::ScreenSleeping = $true
         [Win32KryptexBoundV6]::ForceSleepMode = $isForce
-        [Win32KryptexBoundV6]::SetInputIgnorePeriod(3500)
+        [Win32KryptexBoundV6]::SetInputIgnorePeriod(5000)
         if ($lockWorkstation) {
             try { [Win32KryptexBoundV6]::LockWorkStation() | Out-Null } catch {}
+            Start-Sleep -Milliseconds 600
         }
         [Win32KryptexBoundV6]::TurnScreenOff($script:ourHwnd)
     }
 
     $script:sleepNowBtn.Add_Click({
-        & $script:executeScreenOff "User clicked [Sleep Now]" $false $true
+        # Behaves exactly like Ctrl+Alt+L: lock Windows and sleep all monitors
+        try { [Win32KryptexBoundV6]::ShowWindow($script:ourHwnd, 0) | Out-Null } catch {}
+        # Let the mouse button fully release before sleeping so the click cannot wake the screens
+        Start-Sleep -Milliseconds 500
+        & $script:executeScreenOff "User clicked [Sleep Now] (same as Ctrl+Alt+L)" $true $true
     })
 
     $script:helper = New-Object System.Windows.Interop.WindowInteropHelper($script:window)
@@ -798,6 +823,7 @@ public class Win32KryptexBoundV6 {
     $script:sessionSwitchHandler = [Microsoft.Win32.SessionSwitchEventHandler]{
         param($s, $e)
         if ($e.Reason -eq [Microsoft.Win32.SessionSwitchReason]::SessionLock) {
+            Start-Sleep -Milliseconds 600
             & $script:executeScreenOff "Windows session locked (Win+L / SessionLock)" $false $true
         }
     }
@@ -808,10 +834,10 @@ public class Win32KryptexBoundV6 {
         if ($msg -eq 0x0312) { # WM_HOTKEY
             $hotkeyId = [int]$wParam
             if ($hotkeyId -eq 2) {
-                # Ctrl+Alt+L pressed
-                & $script:executeScreenOff "Hotkey pressed [Ctrl+Alt+L]" $false $true
+                # Ctrl+Alt+L pressed -> Lock Windows and sleep monitors
+                & $script:executeScreenOff "Hotkey pressed [Ctrl+Alt+L]" $true $true
             } else {
-                # Win+Shift+L pressed
+                # Win+Shift+L pressed -> Just sleep monitors without locking
                 & $script:executeScreenOff "Hotkey pressed [Win+Shift+L]" $false $true
             }
             $handled = $true
